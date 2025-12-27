@@ -1,8 +1,21 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:flutter_downloader/flutter_downloader.dart'; // Import this
 import 'features/chat/presentation/screens/splash_screen.dart';
+import 'features/chat/presentation/providers/chat_provider.dart';
 
-void main() {
-  runApp(const ChizaApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize the Background Downloader
+  await FlutterDownloader.initialize(debug: true, ignoreSsl: true);
+
+  runApp(
+    MultiProvider(
+      providers: [ChangeNotifierProvider(create: (_) => ChatProvider())],
+      child: const ChizaApp(),
+    ),
+  );
 }
 
 class ChizaApp extends StatelessWidget {

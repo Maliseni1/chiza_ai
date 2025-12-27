@@ -1,6 +1,11 @@
+import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:chiza_ai/core/services/model_service.dart'; // Ensure this import path matches yours
-import 'home_screen.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:provider/provider.dart';
+import 'package:chiza_ai/core/services/download_service.dart';
+import 'package:chiza_ai/features/chat/presentation/screens/home_screen.dart';
+import 'package:chiza_ai/features/chat/presentation/providers/chat_provider.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -10,124 +15,166 @@ class SplashScreen extends StatefulWidget {
 }
 
 class _SplashScreenState extends State<SplashScreen> {
-  final ModelService _modelService = ModelService();
+  final DownloadService _downloadService = DownloadService();
 
   // State variables
-  bool _isDownloading = false;
-  String _statusMessage = "Checking AI Brain...";
+  bool _showBranding = true;
   double _progress = 0.0;
-  String _downloadedMB = "0";
-  String _totalMB = "0";
+  String _status = ""; // Empty initially so it doesn't show during branding
+  bool _hasError = false;
 
   @override
   void initState() {
     super.initState();
-    _checkModel();
+    // Start the strict 3-second timer
+    _runSplashSequence();
   }
 
-  Future<void> _checkModel() async {
-    bool exists = await _modelService.isModelDownloaded();
-    if (exists) {
-      _navigateToHome();
-    } else {
-      setState(() {
-        _statusMessage = "AI Model Missing.\nDownload required (~1GB).";
+  Future<void> _runSplashSequence() async {
+    // 1. WAIT exactly 3 seconds (Branding visible)
+    await Future.delayed(const Duration(seconds: 3));
+
+    if (!mounted) return;
+
+    // 2. HIDE Branding
+    setState(() {
+      _showBranding = false;
+      _status = "Checking permissions...";
+    });
+
+    // 3. CHECK Permission (Only after branding is gone)
+    await _checkPermissionAndStart();
+  }
+
+  Future<void> _checkPermissionAndStart() async {
+    // On Android 13+, simple file storage often doesn't need explicit runtime
+    // permissions if we use the App Sandbox (which we are).
+    // However, to satisfy your requirement for a dialog flow:
+
+    if (Platform.isAndroid) {
+      // Requesting 'storage' on Android 13+ usually returns denied implicitly.
+      // We try it, but if it fails, we assume we can proceed because we
+      // updated DownloadService to use the App Sandbox (DocumentsDirectory).
+      await Permission.storage.request();
+    }
+
+    // Proceed regardless of result because we are using a safe directory now
+    _startDownload();
+  }
+
+  Future<void> _startDownload() async {
+    setState(() {
+      _status = "Connecting to Chiza Brain...";
+      _hasError = false;
+    });
+
+    try {
+      final path = await _downloadService.downloadModel((percentage) {
+        if (mounted) {
+          setState(() {
+            _progress = percentage / 100;
+            _status = "Downloading Brain... $percentage%";
+          });
+        }
       });
+
+      if (mounted) {
+        setState(() => _status = "Initializing AI...");
+        await Provider.of<ChatProvider>(
+          context,
+          listen: false,
+        ).loadModelFromPath(path);
+        _navigateToHome();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _status = "Connection Failed.\nCheck Internet.";
+          _hasError = true;
+        });
+      }
     }
   }
 
   void _navigateToHome() {
     Navigator.pushReplacement(
       context,
-      MaterialPageRoute(builder: (context) => const HomeScreen()),
+      MaterialPageRoute(builder: (_) => const HomeScreen()),
     );
-  }
-
-  Future<void> _startDownload() async {
-    setState(() {
-      _isDownloading = true;
-      _statusMessage = "Initializing Download...";
-    });
-
-    try {
-      await _modelService.downloadModel(
-        onProgress: (received, total) {
-          if (total != -1) {
-            setState(() {
-              _progress = received / total;
-              _downloadedMB = (received / 1024 / 1024).toStringAsFixed(1);
-              _totalMB = (total / 1024 / 1024).toStringAsFixed(1);
-              _statusMessage = "Downloading Brain...";
-            });
-          }
-        },
-      );
-      // Success!
-      _navigateToHome();
-    } catch (e) {
-      // Check if the widget is still on screen before updating UI
-      if (!mounted) return;
-
-      setState(() {
-        _isDownloading = false;
-        _statusMessage = "Download Failed.\nPlease check your connection.";
-        _progress = 0.0;
-      });
-
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Error: $e')));
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.psychology, size: 80, color: Colors.blueAccent),
-              const SizedBox(height: 20),
+      backgroundColor: Colors.white,
+      body: Stack(
+        children: [
+          // CENTER CONTENT
+          Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // LOGO - Ensure "assets/icon/" is in pubspec.yaml
+                Image.asset("assets/icon/app_logo.png", width: 150),
 
-              const Text(
-                "Chiza AI",
-                style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 10),
+                const SizedBox(height: 30),
 
-              Text(
-                _statusMessage,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 16, color: Colors.grey),
-              ),
-              const SizedBox(height: 30),
-
-              if (_isDownloading) ...[
-                LinearProgressIndicator(value: _progress),
-                const SizedBox(height: 10),
-                Text(
-                  "${(_progress * 100).toStringAsFixed(0)}%  ($_downloadedMB / $_totalMB MB)",
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                ),
-              ] else ...[
-                ElevatedButton.icon(
-                  onPressed: _startDownload,
-                  icon: const Icon(Icons.download),
-                  label: const Text("Download AI Model (1 GB)"),
-                  style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 24,
-                      vertical: 12,
+                // Status & Progress (HIDDEN during first 3 seconds)
+                if (!_showBranding) ...[
+                  Text(
+                    _status,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
-                ),
+                  const SizedBox(height: 20),
+
+                  if (!_hasError && _progress < 1.0)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 50),
+                      child: LinearProgressIndicator(
+                        value: _progress > 0 ? _progress : null,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+
+                  if (_hasError)
+                    ElevatedButton(
+                      onPressed: _startDownload,
+                      child: const Text("Retry"),
+                    ),
+                ],
               ],
-            ],
+            ),
           ),
-        ),
+
+          // BOTTOM BRANDING (Visible ONLY when _showBranding is true)
+          if (_showBranding)
+            const Positioned(
+              bottom: 40,
+              left: 0,
+              right: 0,
+              child: Column(
+                children: [
+                  Text(
+                    "From",
+                    style: TextStyle(color: Colors.grey, fontSize: 14),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    "Chiza Labs",
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
       ),
     );
   }
