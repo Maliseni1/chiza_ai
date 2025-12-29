@@ -22,9 +22,13 @@ android {
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.chiza.chiza_ai"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        
+        // --- CHANGED THIS LINE 👇 ---
+        // Changed from flutter.minSdkVersion to 24. 
+        // This is required for the C++ AI engine to run correctly on Android.
+        minSdk = 24 
+        // ---------------------------
+        
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
