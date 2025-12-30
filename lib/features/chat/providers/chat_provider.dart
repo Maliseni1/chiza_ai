@@ -1,144 +1,204 @@
-import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:chiza_ai/features/chat/domain/message.dart';
-import 'package:chiza_ai/core/services/llama_service.dart';
+import 'package:llama_cpp_dart/llama_cpp_dart.dart';
+import 'package:path_provider/path_provider.dart';
+
+// --- Helper Classes ---
+
+enum ChatMessageRole { user, model }
+
+class ChatMessage {
+  final ChatMessageRole role;
+  final String content;
+
+  ChatMessage({required this.role, required this.content});
+
+  bool get isUser => role == ChatMessageRole.user;
+}
+
+class ChatSession {
+  final String id;
+  final String title;
+  final DateTime date;
+
+  ChatSession({required this.id, required this.title, required this.date});
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'title': title,
+    'date': date.toIso8601String(),
+  };
+
+  factory ChatSession.fromJson(Map<String, dynamic> json) => ChatSession(
+    id: json['id'],
+    title: json['title'],
+    date: DateTime.parse(json['date']),
+  );
+}
+
+// --- Provider ---
 
 class ChatProvider extends ChangeNotifier {
-  List<Message> _messages = [];
-  final LlamaService _llamaService = LlamaService();
+  Llama? _llama;
+  final List<ChatMessage> _messages = [];
+  final List<ChatSession> _history = [];
 
   bool _isTyping = false;
-  bool _isModelLoaded = false;
   String? _errorMessage;
+  bool _isModelLoaded = false;
 
-  List<Message> get messages => _messages;
-  bool get isTyping => _isTyping;
   bool get isModelLoaded => _isModelLoaded;
+  bool get isTyping => _isTyping;
   String? get errorMessage => _errorMessage;
+  List<ChatMessage> get messages => List.unmodifiable(_messages);
+  List<ChatSession> get history => List.unmodifiable(_history);
 
+  /// Loads the GGUF model from the filesystem
   Future<void> loadModelFromPath(String path) async {
-    _isModelLoaded = false;
-    _errorMessage = null;
-    notifyListeners();
-
     try {
-      await _llamaService.initModel(path);
-      await _loadHistoryFromStorage();
-      _isModelLoaded = true;
-      notifyListeners();
+      if (await File(path).exists()) {
+        // Initialize Llama with the path
+        _llama = Llama(path);
+
+        _isModelLoaded = true;
+        _errorMessage = null;
+        notifyListeners();
+      } else {
+        throw Exception("Model file not found at $path");
+      }
     } catch (e) {
-      _errorMessage = "Error: $e";
+      _errorMessage = "Failed to load brain: $e";
+      debugPrint(_errorMessage);
       _isModelLoaded = false;
       notifyListeners();
     }
   }
 
-  Future<void> sendMessage(String content) async {
-    if (!_isModelLoaded) return;
+  /// Sends a message and gets a response
+  Future<void> sendMessage(String text) async {
+    if (_llama == null) {
+      _errorMessage = "Brain not loaded!";
+      notifyListeners();
+      return;
+    }
+
+    _errorMessage = null;
 
     // 1. Add User Message
-    final userMsg = Message(
-      content: content,
-      isUser: true,
-      timestamp: DateTime.now(),
-    );
-    _messages.add(userMsg);
-    _saveHistoryToStorage();
-
+    _messages.add(ChatMessage(role: ChatMessageRole.user, content: text));
     _isTyping = true;
     notifyListeners();
 
     try {
-      final aiMessageIndex = _messages.length;
-      String currentAiResponse = "";
+      // 2. Format Prompt for the AI
+      String prompt = "";
+      for (var msg in _messages) {
+        if (msg.role == ChatMessageRole.user) {
+          prompt += "User: ${msg.content}\n";
+        } else {
+          prompt += "Assistant: ${msg.content}\n";
+        }
+      }
+      prompt += "Assistant:";
 
-      // 2. THIS ADDS THE "THINKING..." BUBBLE
-      _messages.add(
-        Message(
-          content: "Thinking...",
-          isUser: false,
-          timestamp: DateTime.now(),
-        ),
-      );
-      notifyListeners();
+      // 3. Prepare Bot Message Placeholder
+      _messages.add(ChatMessage(role: ChatMessageRole.model, content: ""));
+      int botMsgIndex = _messages.length - 1;
+      String botResponse = "";
 
-      // 3. Send relevant history to AI (excluding the "Thinking..." bubble)
-      final historyToSend = _messages.sublist(0, _messages.length - 1);
+      // 4. Set the prompt
+      _llama!.setPrompt(prompt);
 
-      await for (final token in _llamaService.streamResponse(
-        historyToSend,
-        content,
-      )) {
-        currentAiResponse += token;
+      // 5. Generate Response Loop
+      while (true) {
+        // getNext returns (String token, bool done)
+        // logic: token is never null in this version
+        var (token, done) = _llama!.getNext();
 
-        // Update the bubble in real-time
-        _messages[aiMessageIndex] = Message(
-          content: currentAiResponse.trim(),
-          isUser: false,
-          timestamp: DateTime.now(),
+        botResponse += token;
+        _messages[botMsgIndex] = ChatMessage(
+          role: ChatMessageRole.model,
+          content: botResponse,
         );
         notifyListeners();
+
+        if (done) break;
+
+        // Small delay to prevent UI freezing
+        await Future.delayed(Duration.zero);
       }
 
-      _saveHistoryToStorage();
+      _isTyping = false;
+      _addToHistoryIfNeeded(text);
+      notifyListeners();
     } catch (e) {
       _messages.add(
-        Message(content: "Error: $e", isUser: false, timestamp: DateTime.now()),
+        ChatMessage(role: ChatMessageRole.model, content: "Error: $e"),
       );
-    } finally {
       _isTyping = false;
       notifyListeners();
     }
   }
 
-  // 3. THIS HANDLES THE "NEW CHAT" BUTTON
-  Future<void> startNewChat() async {
+  /// Clears current chat (UI only)
+  void startNewChat() {
     _messages.clear();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('chat_history');
+    _errorMessage = null;
     notifyListeners();
   }
 
-  Future<void> _saveHistoryToStorage() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String encodedData = jsonEncode(
-      _messages
-          .map(
-            (m) => {
-              'content': m.content,
-              'isUser': m.isUser,
-              'timestamp': m.timestamp.toIso8601String(),
-            },
-          )
-          .toList(),
-    );
-    await prefs.setString('chat_history', encodedData);
-  }
-
-  Future<void> _loadHistoryFromStorage() async {
-    final prefs = await SharedPreferences.getInstance();
-    final String? data = prefs.getString('chat_history');
-    if (data != null) {
-      final List<dynamic> decoded = jsonDecode(data);
-      _messages = decoded
-          .map(
-            (item) => Message(
-              content: item['content'],
-              isUser: item['isUser'],
-              timestamp:
-                  DateTime.tryParse(item['timestamp'] ?? "") ?? DateTime.now(),
-            ),
-          )
-          .toList();
+  void _addToHistoryIfNeeded(String firstMessage) {
+    if (_messages.length == 2) {
+      final title = firstMessage.length > 30
+          ? "${firstMessage.substring(0, 30)}..."
+          : firstMessage;
+      final newSession = ChatSession(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        title: title,
+        date: DateTime.now(),
+      );
+      _history.insert(0, newSession);
+      _saveHistoryToDisk();
       notifyListeners();
     }
   }
 
-  @override
-  void dispose() {
-    _llamaService.dispose();
-    super.dispose();
+  Future<void> loadHistory() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final file = File('${dir.path}/chat_history.json');
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        final List<dynamic> jsonList = jsonDecode(content);
+        _history.clear();
+        _history.addAll(jsonList.map((e) => ChatSession.fromJson(e)).toList());
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint("Error loading history: $e");
+    }
+  }
+
+  Future<void> _saveHistoryToDisk() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final file = File('${dir.path}/chat_history.json');
+      final jsonList = _history.map((e) => e.toJson()).toList();
+      await file.writeAsString(jsonEncode(jsonList));
+    } catch (e) {
+      debugPrint("Error saving history: $e");
+    }
+  }
+
+  Future<void> clearAllHistory() async {
+    _history.clear();
+    _messages.clear();
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/chat_history.json');
+    if (await file.exists()) {
+      await file.delete();
+    }
+    notifyListeners();
   }
 }

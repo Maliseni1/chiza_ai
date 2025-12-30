@@ -21,38 +21,77 @@ class _StartupScreenState extends State<StartupScreen> {
   }
 
   Future<void> _checkBrain() async {
-    // 1. Get the path
-    final dir = await getApplicationDocumentsDirectory();
-    final modelPath = "${dir.path}/qwen2.5-1.5b-instruct-q4_k_m.gguf";
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final modelPath = "${dir.path}/qwen2.5-1.5b-instruct-q4_k_m.gguf";
 
-    if (!mounted) return;
+      if (!mounted) return;
 
-    // 2. Check if file exists
-    final bool fileExists = File(modelPath).existsSync();
+      final file = File(modelPath);
 
-    if (fileExists) {
-      // 3a. If Found: Load it and go to Home
-      final chatProvider = Provider.of<ChatProvider>(context, listen: false);
-      await chatProvider.loadModelFromPath(modelPath);
+      if (await file.exists()) {
+        final fileSize = await file.length();
 
-      if (mounted) {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (context) => const HomeScreen()),
-        );
+        // FIX: Lower threshold to 800MB (approx 0.8GB).
+        // The Q4_K_M model is usually ~1.1GB, so 1.4GB was deleting valid files.
+        const minSize = 1024 * 1024 * 800;
+
+        if (fileSize < minSize) {
+          debugPrint(
+            "Startup: File too small ($fileSize bytes). Deleting corrupt file.",
+          );
+          await file.delete();
+          if (!mounted) return;
+          _goToSetup();
+          return;
+        }
+
+        try {
+          if (!mounted) return;
+          final chatProvider = Provider.of<ChatProvider>(
+            context,
+            listen: false,
+          );
+
+          // Load existing history (New Feature)
+          await chatProvider.loadHistory();
+
+          // Load the Brain
+          await chatProvider
+              .loadModelFromPath(modelPath)
+              .timeout(
+                const Duration(seconds: 15),
+                onTimeout: () => throw Exception("Timeout"),
+              );
+
+          if (!mounted) return;
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (context) => const HomeScreen()),
+          );
+        } catch (e) {
+          debugPrint("Startup: Loading failed ($e). Redirecting.");
+          if (!mounted) return;
+          _goToSetup();
+        }
+      } else {
+        _goToSetup();
       }
-    } else {
-      // 3b. If Missing: Go to Setup Screen to download it
-      if (mounted) {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (context) => const ModelSetupScreen()),
-        );
-      }
+    } catch (e) {
+      if (!mounted) return;
+      _goToSetup();
+    }
+  }
+
+  void _goToSetup() {
+    if (mounted) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (context) => const ModelSetupScreen()),
+      );
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    // Simple loading spinner while checking file system
     return const Scaffold(body: Center(child: CircularProgressIndicator()));
   }
 }

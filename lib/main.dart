@@ -1,9 +1,20 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:flutter_downloader/flutter_downloader.dart'; // 1. Added Import
 import 'package:chiza_ai/features/chat/providers/chat_provider.dart';
-import 'package:chiza_ai/features/chat/presentation/screens/startup_screen.dart'; // Import StartupScreen
+import 'package:chiza_ai/features/chat/presentation/screens/startup_screen.dart';
 
-void main() {
+void main() async {
+  // 2. Made main async
+  // 3. Ensure Flutter bindings are initialized before calling plugins
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 4. Initialize the Background Downloader Plugin
+  await FlutterDownloader.initialize(
+    debug: true, // optional: set false to disable printing logs to console
+    ignoreSsl: true, // optional: set false to disable checking SSL certificate
+  );
+
   runApp(
     MultiProvider(
       providers: [ChangeNotifierProvider(create: (_) => ChatProvider())],
