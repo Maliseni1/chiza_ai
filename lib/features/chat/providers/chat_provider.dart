@@ -1,120 +1,91 @@
 import 'dart:async';
-import 'dart:io'; // Needed for File and Platform checks
-import 'package:flutter/foundation.dart'; // For debugPrint
+import 'dart:convert';
 import 'package:flutter/material.dart';
-
-// Hide Message from the library so we can use YOUR Message class
-import 'package:llama_cpp_dart/llama_cpp_dart.dart' hide Message;
-
-// Import your domain Message class
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:chiza_ai/features/chat/domain/message.dart';
+import 'package:chiza_ai/core/services/llama_service.dart';
 
 class ChatProvider extends ChangeNotifier {
-  final List<Message> _messages = [];
+  List<Message> _messages = [];
+  final LlamaService _llamaService = LlamaService();
 
   bool _isTyping = false;
   bool _isModelLoaded = false;
-  String? _errorMessage; // NEW: Variable to store load errors
-
-  Llama? _llamaProcessor;
+  String? _errorMessage;
 
   List<Message> get messages => _messages;
   bool get isTyping => _isTyping;
   bool get isModelLoaded => _isModelLoaded;
-  String? get errorMessage => _errorMessage; // NEW: Expose error to UI
+  String? get errorMessage => _errorMessage;
 
   Future<void> loadModelFromPath(String path) async {
-    // 1. Reset state before loading
     _isModelLoaded = false;
     _errorMessage = null;
     notifyListeners();
 
     try {
-      debugPrint("Initializing Llama from: $path");
-
-      // 2. Check if file actually exists
-      if (!File(path).existsSync()) {
-        throw Exception("Model file missing at: $path");
-      }
-
-      // 3. Android-specific library mapping (Crucial for many Android devices)
-      if (Platform.isAndroid) {
-        Llama.libraryPath = "libllama.so";
-      }
-
-      // 4. Initialize Brain
-      _llamaProcessor = Llama(path);
-
-      // 5. Set System Prompt
-      _llamaProcessor!.setPrompt("You are Chiza, a helpful AI assistant.");
-
-      // Success!
+      await _llamaService.initModel(path);
+      await _loadHistoryFromStorage();
       _isModelLoaded = true;
       notifyListeners();
-      debugPrint("Brain (Llama) is Online!");
     } catch (e) {
-      debugPrint("CRITICAL ERROR LOADING BRAIN: $e");
-
-      // FIX: Store the error so the UI can stop spinning and show it
-      _errorMessage = "Failed to load Brain: $e";
+      _errorMessage = "Error: $e";
       _isModelLoaded = false;
       notifyListeners();
     }
   }
 
   Future<void> sendMessage(String content) async {
-    if (_llamaProcessor == null) {
-      _messages.add(
-        Message(
-          content: "Brain is not loaded yet.",
-          isUser: false,
-          timestamp: DateTime.now(),
-        ),
-      );
-      notifyListeners();
-      return;
-    }
+    if (!_isModelLoaded) return;
 
-    // Add User Message
-    _messages.add(
-      Message(content: content, isUser: true, timestamp: DateTime.now()),
+    // 1. Add User Message
+    final userMsg = Message(
+      content: content,
+      isUser: true,
+      timestamp: DateTime.now(),
     );
+    _messages.add(userMsg);
+    _saveHistoryToStorage();
 
     _isTyping = true;
     notifyListeners();
 
     try {
-      // Feed input to Llama
-      _llamaProcessor!.setPrompt(content);
+      final aiMessageIndex = _messages.length;
+      String currentAiResponse = "";
 
-      StringBuffer buffer = StringBuffer();
-
-      // Loop to get tokens one by one (Streaming effect)
-      while (true) {
-        final (token, done) = _llamaProcessor!.getNext();
-        buffer.write(token);
-
-        // Allow UI to breathe/update
-        await Future.delayed(Duration.zero);
-
-        if (done) break;
-      }
-
-      String fullReply = buffer.toString().trim();
-      if (fullReply.isEmpty) fullReply = "...";
-
-      // Add AI Reply
-      _messages.add(
-        Message(content: fullReply, isUser: false, timestamp: DateTime.now()),
-      );
-    } catch (e) {
-      debugPrint("Generation Error: $e");
+      // 2. THIS ADDS THE "THINKING..." BUBBLE
       _messages.add(
         Message(
-          content: "Error generating reply: $e",
+          content: "Thinking...",
           isUser: false,
           timestamp: DateTime.now(),
         ),
+      );
+      notifyListeners();
+
+      // 3. Send relevant history to AI (excluding the "Thinking..." bubble)
+      final historyToSend = _messages.sublist(0, _messages.length - 1);
+
+      await for (final token in _llamaService.streamResponse(
+        historyToSend,
+        content,
+      )) {
+        currentAiResponse += token;
+
+        // Update the bubble in real-time
+        _messages[aiMessageIndex] = Message(
+          content: currentAiResponse.trim(),
+          isUser: false,
+          timestamp: DateTime.now(),
+        );
+        notifyListeners();
+      }
+
+      _saveHistoryToStorage();
+    } catch (e) {
+      _messages.add(
+        Message(content: "Error: $e", isUser: false, timestamp: DateTime.now()),
       );
     } finally {
       _isTyping = false;
@@ -122,9 +93,52 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
+  // 3. THIS HANDLES THE "NEW CHAT" BUTTON
+  Future<void> startNewChat() async {
+    _messages.clear();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('chat_history');
+    notifyListeners();
+  }
+
+  Future<void> _saveHistoryToStorage() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String encodedData = jsonEncode(
+      _messages
+          .map(
+            (m) => {
+              'content': m.content,
+              'isUser': m.isUser,
+              'timestamp': m.timestamp.toIso8601String(),
+            },
+          )
+          .toList(),
+    );
+    await prefs.setString('chat_history', encodedData);
+  }
+
+  Future<void> _loadHistoryFromStorage() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? data = prefs.getString('chat_history');
+    if (data != null) {
+      final List<dynamic> decoded = jsonDecode(data);
+      _messages = decoded
+          .map(
+            (item) => Message(
+              content: item['content'],
+              isUser: item['isUser'],
+              timestamp:
+                  DateTime.tryParse(item['timestamp'] ?? "") ?? DateTime.now(),
+            ),
+          )
+          .toList();
+      notifyListeners();
+    }
+  }
+
   @override
   void dispose() {
-    _llamaProcessor?.dispose();
+    _llamaService.dispose();
     super.dispose();
   }
 }
