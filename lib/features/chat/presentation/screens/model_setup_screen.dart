@@ -1,12 +1,8 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:isolate';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:flutter_downloader/flutter_downloader.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:chiza_ai/features/chat/presentation/screens/home_screen.dart';
 import 'package:chiza_ai/features/chat/providers/chat_provider.dart';
 
@@ -18,56 +14,52 @@ class ModelSetupScreen extends StatefulWidget {
 }
 
 class _ModelSetupScreenState extends State<ModelSetupScreen> {
-  final ReceivePort _port = ReceivePort();
-
+  // Logic Variables
   bool _isChecking = true;
   bool _isDownloading = false;
   String _status = "Checking for existing brain...";
-  String? _taskId;
-  Timer? _monitorTimer;
-
+  
+  // Display Variables
   double _progressValue = 0.0;
   String _progressText = "0%";
   String _sizeText = "";
   String _speedText = "";
   String _etaText = "";
 
-  int _lastBytes = 0;
-  int _lastTime = 0;
+  // Download Control
+  HttpClientResponse? _response;
+  IOSink? _sink;
+  bool _cancelDownload = false;
 
   final String _modelFileName = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
-  static const int _kModelTotalBytes = 1230000000;
+  // Fallback size if header is missing (1.23 GB)
+  static const int _kFallbackSize = 1230000000;
 
   @override
   void initState() {
     super.initState();
-    _bindBackgroundIsolate();
     _checkExistingFile();
   }
 
   @override
   void dispose() {
-    _unbindBackgroundIsolate();
-    _stopMonitor();
+    _cancelDownload = true;
+    _sink?.close(); 
     super.dispose();
   }
 
-  Future<String> _getSaveDir() async {
-    if (Platform.isAndroid) {
-      final dir = await getExternalStorageDirectory();
-      if (dir != null) {
-        return dir.path;
-      }
-    }
-    final dir = await getApplicationDocumentsDirectory();
+  // Use Internal App Sandbox (100% Safe, No Permissions Needed)
+  Future<String> _getSafeDir() async {
+    final dir = await getApplicationSupportDirectory();
     return dir.path;
   }
 
   Future<void> _checkExistingFile() async {
     try {
-      final dirPath = await _getSaveDir();
+      final dirPath = await _getSafeDir();
       final file = File("$dirPath/$_modelFileName");
 
+      // Check if exists and is big enough
       if (await file.exists() && await file.length() > 100000000) {
         setState(() {
           _isChecking = false;
@@ -76,204 +68,135 @@ class _ModelSetupScreenState extends State<ModelSetupScreen> {
         _finalizeSetup();
       } else {
         if (mounted) {
-          setState(() {
-            _isChecking = false;
-            _status = "";
+          setState(() { 
+            _isChecking = false; 
+            _status = ""; 
           });
         }
       }
     } catch (e) {
       if (mounted) {
-        setState(() {
-          _isChecking = false;
-          _status = "";
+        setState(() { 
+          _isChecking = false; 
+          _status = ""; 
         });
       }
     }
   }
 
-  void _bindBackgroundIsolate() {
-    bool isSuccess = IsolateNameServer.registerPortWithName(
-      _port.sendPort,
-      'downloader_send_port',
-    );
-    if (!isSuccess) {
-      _unbindBackgroundIsolate();
-      _bindBackgroundIsolate();
-      return;
-    }
-    _port.listen((dynamic data) {
-      String id = data[0];
-      DownloadTaskStatus status = data[1];
-
-      if (_taskId == id && mounted) {
-        if (status == DownloadTaskStatus.complete) {
-          _stopMonitor();
-          setState(() {
-            _status = "Download Complete!";
-            _isDownloading = false;
-            _progressValue = 1.0;
-          });
-          _finalizeSetup();
-        } else if (status == DownloadTaskStatus.failed) {
-          _stopMonitor();
-          setState(() {
-            _status = "Download Failed. Retrying...";
-            _isDownloading = false;
-          });
-          _retryDownload();
-        } else if (status == DownloadTaskStatus.canceled) {
-          _stopMonitor();
-          setState(() {
-            _isDownloading = false;
-          });
-        }
-      }
-    });
-    FlutterDownloader.registerCallback(downloadCallback);
-  }
-
-  void _unbindBackgroundIsolate() {
-    IsolateNameServer.removePortNameMapping('downloader_send_port');
-  }
-
-  @pragma('vm:entry-point')
-  static void downloadCallback(String id, int status, int progress) {
-    final SendPort? send = IsolateNameServer.lookupPortByName(
-      'downloader_send_port',
-    );
-    send?.send([id, DownloadTaskStatus.fromInt(status), progress]);
-  }
-
-  Future<void> _startBackgroundDownload() async {
-    await Permission.notification.request();
-
-    var storageStatus = await Permission.storage.status;
-    if (!storageStatus.isGranted) {
-      await Permission.storage.request();
-    }
-    if (await Permission.storage.isDenied) {
-      await Permission.manageExternalStorage.request();
-    }
-
+  // --- THE UNORTHODOX DOWNLOADER ---
+  Future<void> _startForegroundDownload() async {
     setState(() {
       _isDownloading = true;
-      _status = "Starting...";
+      _cancelDownload = false;
+      _status = "Connecting to Neural Network...";
       _progressValue = 0.0;
-      _lastBytes = 0;
-      _lastTime = DateTime.now().millisecondsSinceEpoch;
     });
 
     try {
-      final saveDir = await _getSaveDir();
-      final savedDirObj = Directory(saveDir);
-      if (!savedDirObj.existsSync()) {
-        savedDirObj.createSync(recursive: true);
+      final dirPath = await _getSafeDir();
+      final file = File("$dirPath/$_modelFileName");
+      
+      // 1. Create the Client
+      final client = HttpClient();
+      // Bypass SSL errors if any (common 'hack' for stability)
+      client.badCertificateCallback = (cert, host, port) => true;
+
+      // 2. Open Connection
+      final request = await client.getUrl(Uri.parse(
+        "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true"
+      ));
+      
+      // Close the request to get the response stream
+      _response = await request.close();
+
+      if (_response!.statusCode != 200) {
+        throw Exception("Server Error: ${_response!.statusCode}");
       }
 
-      if (_taskId != null) {
-        await FlutterDownloader.cancel(taskId: _taskId!);
+      // 3. Setup File Writing
+      _sink = file.openWrite();
+      
+      // 4. Setup Progress Tracking
+      int totalBytes = _response!.contentLength;
+      if (totalBytes == -1) {
+        totalBytes = _kFallbackSize;
+      }
+      
+      int receivedBytes = 0;
+      int lastBytes = 0;
+      int lastTime = DateTime.now().millisecondsSinceEpoch;
+      
+      // 5. Listen to the Stream (The Loop)
+      await for (var chunk in _response!) {
+        if (_cancelDownload) {
+          await _sink?.close();
+          await file.delete(); // Delete partial file
+          return;
+        }
+
+        // Write chunk
+        _sink?.add(chunk);
+        receivedBytes += chunk.length;
+
+        // UI Updates (Throttled to every 500ms to save resources)
+        int now = DateTime.now().millisecondsSinceEpoch;
+        if (now - lastTime > 500 || receivedBytes == totalBytes) {
+          double progress = receivedBytes / totalBytes;
+          
+          // Speed calc
+          int bytesDiff = receivedBytes - lastBytes;
+          int timeDiff = now - lastTime;
+          double speed = (bytesDiff / 1024) / (timeDiff / 1000); // KB/s
+          
+          // ETA calc
+          int remaining = totalBytes - receivedBytes;
+          double eta = (bytesDiff > 0) ? (remaining / bytesDiff) * (timeDiff/1000) : 0;
+
+          if (mounted) {
+            setState(() {
+              _progressValue = progress;
+              _progressText = "${(progress * 100).toStringAsFixed(1)}%";
+              _sizeText = "${_formatBytes(receivedBytes)} / ${_formatBytes(totalBytes)}";
+              _speedText = _formatSpeed(speed);
+              _etaText = _formatDuration(Duration(seconds: eta.toInt()));
+            });
+          }
+
+          lastBytes = receivedBytes;
+          lastTime = now;
+        }
       }
 
-      const url =
-          "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true";
+      // 6. Done
+      await _sink?.flush();
+      await _sink?.close();
+      
+      if (mounted) {
+        setState(() {
+            _status = "Verifying...";
+            _progressValue = 1.0;
+        });
+        _finalizeSetup();
+      }
 
-      _taskId = await FlutterDownloader.enqueue(
-        url: url,
-        headers: {
-          "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        },
-        savedDir: saveDir,
-        fileName: _modelFileName,
-        showNotification: true,
-        openFileFromNotification: false,
-        saveInPublicStorage: false,
-      );
-
-      _startMonitor();
     } catch (e) {
-      setState(() {
-        _isDownloading = false;
-        _status = "Error: $e";
-      });
+      if (mounted) {
+        setState(() {
+          _isDownloading = false;
+          _status = "Download Failed: $e";
+        });
+      }
     }
   }
 
-  void _retryDownload() {
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted && !_isDownloading) {
-        _startBackgroundDownload();
-      }
-    });
-  }
-
-  void _startMonitor() {
-    _stopMonitor();
-    _monitorTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
-      if (_taskId == null) {
-        return;
-      }
-
-      final tasks = await FlutterDownloader.loadTasksWithRawQuery(
-        query: "SELECT * FROM task WHERE task_id = '$_taskId'",
-      );
-
-      if (tasks != null && tasks.isNotEmpty) {
-        final task = tasks.first;
-
-        if (task.status == DownloadTaskStatus.running) {
-          int total = _kModelTotalBytes;
-          int received = (total * (task.progress / 100)).toInt();
-
-          int now = DateTime.now().millisecondsSinceEpoch;
-          int timeDiff = now - _lastTime;
-
-          if (timeDiff >= 1000) {
-            int bytesDiff = received - _lastBytes;
-            if (bytesDiff < 0) {
-              bytesDiff = 0;
-            }
-
-            double speed = (bytesDiff / 1024) / (timeDiff / 1000);
-
-            int remainingBytes = total - received;
-            double etaSeconds = (bytesDiff > 0)
-                ? (remainingBytes / bytesDiff) * (timeDiff / 1000)
-                : 0;
-
-            if (mounted) {
-              setState(() {
-                _progressValue = task.progress / 100;
-                _progressText = "${task.progress}%";
-                _sizeText =
-                    "${_formatBytes(received)} / ${_formatBytes(total)}";
-                _speedText = _formatSpeed(speed);
-                _etaText = _formatDuration(
-                  Duration(seconds: etaSeconds.toInt()),
-                );
-              });
-            }
-
-            _lastBytes = received;
-            _lastTime = now;
-          }
-        }
-      }
-    });
-  }
-
-  void _stopMonitor() {
-    _monitorTimer?.cancel();
-    _monitorTimer = null;
-  }
-
+  // --- Formatters ---
   String _formatBytes(int bytes) {
     if (bytes <= 0) {
       return "0 B";
     }
     const suffixes = ["B", "KB", "MB", "GB", "TB"];
-    var i = (bytes <= 0) ? 0 : (bytes.toString().length - 1) ~/ 3;
+    var i = (bytes <= 0) ? 0 : (bytes.toString().length - 1) ~/ 3; 
     if (i > 4) {
       i = 4;
     }
@@ -301,16 +224,13 @@ class _ModelSetupScreenState extends State<ModelSetupScreen> {
   Future<void> _finalizeSetup() async {
     setState(() => _status = "Initializing Brain...");
     try {
-      final dirPath = await _getSaveDir();
+      final dirPath = await _getSafeDir();
       final path = "$dirPath/$_modelFileName";
 
       if (!mounted) {
         return;
       }
-      await Provider.of<ChatProvider>(
-        context,
-        listen: false,
-      ).loadModelFromPath(path);
+      await Provider.of<ChatProvider>(context, listen: false).loadModelFromPath(path);
 
       if (!mounted) {
         return;
@@ -337,49 +257,35 @@ class _ModelSetupScreenState extends State<ModelSetupScreen> {
               const Icon(Icons.psychology, size: 80, color: Colors.deepPurple),
               const SizedBox(height: 24),
               const Text(
-                "Setup Chiza AI",
+                "Load Qwen AI",
                 style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 12),
-
+              
               if (!_isChecking && !_isDownloading)
                 const Text(
-                  "We need to download the brain (1.2 GB) to your device.\nUse Wi-Fi if possible.",
+                  "Downloading brain directly (1.2 GB).\nPlease keep the app OPEN.",
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.grey),
                 ),
-
+                
               const SizedBox(height: 32),
 
               if (_isChecking) ...[
-                const CircularProgressIndicator(),
+                 const CircularProgressIndicator(),
+                 const SizedBox(height: 16),
+                 Text(_status),
+              ]
+              else if (_isDownloading) ...[
+                // PROGRESS UI
+                LinearProgressIndicator(value: _progressValue, minHeight: 10, borderRadius: BorderRadius.circular(5)),
                 const SizedBox(height: 16),
-                Text(_status),
-              ] else if (_isDownloading) ...[
-                LinearProgressIndicator(
-                  value: _progressValue,
-                  minHeight: 10,
-                  borderRadius: BorderRadius.circular(5),
-                ),
-                const SizedBox(height: 16),
-
+                
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      _progressText,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 16,
-                      ),
-                    ),
-                    Text(
-                      _etaText,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        color: Colors.deepPurple,
-                      ),
-                    ),
+                    Text(_progressText, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                    Text(_etaText, style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.deepPurple)),
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -387,41 +293,48 @@ class _ModelSetupScreenState extends State<ModelSetupScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(_sizeText, style: const TextStyle(color: Colors.grey)),
-                    Text(
-                      _speedText,
-                      style: const TextStyle(color: Colors.grey),
-                    ),
+                    Text(_speedText, style: const TextStyle(color: Colors.grey)),
                   ],
                 ),
-
+                
                 const SizedBox(height: 24),
-                const Text(
-                  "You can exit the app. Download continues in background.",
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    // FIXED: Use withValues instead of withOpacity
+                    color: Colors.orange.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    // FIXED: Use withValues instead of withOpacity
+                    border: Border.all(color: Colors.orange.withValues(alpha: 0.3))
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.warning_amber, color: Colors.orange),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          "Do not close or switch apps.\nThe download will fail if you leave.",
+                          style: TextStyle(fontSize: 12, color: Colors.deepOrange),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ] else ...[
                 ElevatedButton.icon(
-                  onPressed: _startBackgroundDownload,
-                  icon: const Icon(Icons.cloud_download),
-                  label: const Text("Download Qwen (1.2 GB)"),
+                  onPressed: _startForegroundDownload,
+                  icon: const Icon(Icons.flash_on),
+                  label: const Text("Start Direct Download"),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.deepPurple,
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 32,
-                      vertical: 16,
-                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
                   ),
                 ),
                 if (_status.isNotEmpty && !_status.contains("Starting"))
                   Padding(
                     padding: const EdgeInsets.only(top: 20.0),
-                    child: Text(
-                      _status,
-                      style: const TextStyle(color: Colors.red),
-                      textAlign: TextAlign.center,
-                    ),
+                    child: Text(_status, style: const TextStyle(color: Colors.red), textAlign: TextAlign.center),
                   ),
               ],
             ],
