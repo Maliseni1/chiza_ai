@@ -1,19 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:flutter_downloader/flutter_downloader.dart'; // 1. Added Import
+// REMOVED: import 'package:flutter_downloader/flutter_downloader.dart'; 
 import 'package:chiza_ai/features/chat/providers/chat_provider.dart';
 import 'package:chiza_ai/features/chat/presentation/screens/startup_screen.dart';
 
 void main() async {
-  // 2. Made main async
-  // 3. Ensure Flutter bindings are initialized before calling plugins
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 4. Initialize the Background Downloader Plugin
-  await FlutterDownloader.initialize(
-    debug: true, // optional: set false to disable printing logs to console
-    ignoreSsl: true, // optional: set false to disable checking SSL certificate
-  );
+  // REMOVED: FlutterDownloader.initialize(...) 
+  // We don't need it anymore since we use standard Dart HttpClient now.
 
   runApp(
     MultiProvider(
@@ -51,7 +46,6 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    // Wait 2 seconds, then go to StartupScreen
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted) {
         Navigator.of(context).pushReplacement(

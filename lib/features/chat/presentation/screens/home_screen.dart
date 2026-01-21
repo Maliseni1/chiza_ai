@@ -3,7 +3,7 @@ import 'package:provider/provider.dart';
 import 'package:chiza_ai/features/chat/providers/chat_provider.dart';
 import 'package:chiza_ai/features/chat/presentation/widgets/chat_bubble.dart';
 import 'package:chiza_ai/features/chat/presentation/widgets/chat_input_field.dart';
-import 'package:chiza_ai/features/chat/presentation/widgets/home_drawer.dart'; // Import Drawer
+import 'package:chiza_ai/features/chat/presentation/screens/settings_screen.dart';
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key});
@@ -18,14 +18,53 @@ class HomeScreen extends StatelessWidget {
     }
 
     return Scaffold(
-      // Add the drawer here (endDrawer puts it on the RIGHT side)
-      endDrawer: const HomeDrawer(),
-
       appBar: AppBar(
         title: const Text("Chiza (Qwen)"),
         backgroundColor: Colors.deepPurple[100],
-        // The hamburger icon is added automatically by Flutter because endDrawer is present
       ),
+      
+      // Changed from 'endDrawer' to standard 'drawer' (Left side)
+      // and defined directly here to ensure navigation works.
+      drawer: Drawer(
+        child: ListView(
+          padding: EdgeInsets.zero,
+          children: [
+            const DrawerHeader(
+              decoration: BoxDecoration(color: Colors.deepPurple),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  Icon(Icons.psychology, color: Colors.white, size: 48),
+                  SizedBox(height: 10),
+                  Text(
+                    "Chiza AI", 
+                    style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold)
+                  ),
+                ],
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.settings),
+              title: const Text('Settings'),
+              onTap: () {
+                Navigator.pop(context); // Close drawer first
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const SettingsScreen()),
+                );
+              },
+            ),
+            const Divider(),
+            ListTile(
+              leading: const Icon(Icons.exit_to_app),
+              title: const Text('Close App'),
+              onTap: () => Navigator.of(context).pop(), // Just closes drawer for now
+            ),
+          ],
+        ),
+      ),
+      
       body: Column(
         children: [
           Expanded(
